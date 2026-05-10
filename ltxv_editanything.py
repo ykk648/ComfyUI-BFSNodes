@@ -1,0 +1,735 @@
+"""LTXV Edit Anything — unified conditioning node for video_to_video_ref_adaln LoRAs.
+
+Single node that applies all 3 conditioning signals from one checkpoint:
+  1. IC-LoRA sequence  — ref image + guide video appended as clean conditioning frames
+  2. Role embedding    — learned 128-dim fingerprint added to ref image tokens so
+                         the model associates @reference with the right appearance
+  3. AdaLN conditioning — pooled ref image projected to every transformer block's
+                          timestep bias, giving a persistent global appearance anchor
+
+Usage in ComfyUI:
+  Load LoRA (standard) → LTXV Edit Anything Apply → KSampler
+"""
+
+import types
+import logging
+
+import torch
+import torch.nn.functional as F
+import folder_paths
+from safetensors.torch import load_file
+
+logger = logging.getLogger("ltxv.editanything")
+
+# ── transformer_options keys (must not collide with other nodes) ──────────────
+_KW_ROLE_WEIGHT   = "ea_role_weight"
+_KW_APP_LATENTS   = "ea_app_latents"
+_KW_ROLE_STRENGTH = "ea_role_strength"
+_KW_ADALN_COND    = "ea_adaln_cond"
+
+
+# ---------------------------------------------------------------------------
+# Model finder
+# ---------------------------------------------------------------------------
+
+def _find_ltxv_model(model):
+    """Traverse ComfyUI's MODEL wrapper nesting to find the LTXVModel/LTXAVModel."""
+    for attr in ("model", "diffusion_model"):
+        cur = model
+        for _ in range(4):
+            if cur is None:
+                break
+            inner = getattr(cur, attr, None)
+            if inner is None:
+                break
+            if hasattr(inner, "_process_input") and hasattr(inner, "patchify_proj"):
+                return inner
+            cur = inner
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Role embedding injection (pre-patchify_proj, 128-dim token space)
+# ---------------------------------------------------------------------------
+
+def _role_inject_tokens(x, additional_args, role_weight, app_latents, strength):
+    """Add role_weight[role_idx] to each token in x [B, S, 128].
+
+    role_weight is [3, 128] with:
+      [0] = target  (zeros — no injection on target tokens)
+      [1] = appearance (embedding.weight[0] from our LoRA — added to ref image tokens)
+      [2] = motion  (zeros — no injection on guide video tokens)
+    """
+    num_guide_tokens = int(additional_args.get("num_guide_tokens", 0))
+    if num_guide_tokens <= 0 or role_weight is None or strength == 0.0:
+        return x
+
+    seq_len = x.shape[1]
+    guide_start = seq_len - num_guide_tokens
+
+    # How many tokens in entry[0] (ref image) to tag as appearance?
+    appearance_count = 0
+    resolved = additional_args.get("resolved_guide_entries")
+    if app_latents > 0 and resolved:
+        first = resolved[0]
+        lshape = first.get("latent_shape")
+        surviving = int(first.get("surviving_count", 0))
+        if lshape and len(lshape) >= 3:
+            tpf = int(lshape[1]) * int(lshape[2])
+            appearance_count = min(app_latents * tpf, surviving, num_guide_tokens)
+
+    # Build per-token role index
+    role_idx = torch.zeros(seq_len, dtype=torch.long, device=x.device)
+    if appearance_count > 0:
+        role_idx[guide_start : guide_start + appearance_count] = 1
+        if guide_start + appearance_count < seq_len:
+            role_idx[guide_start + appearance_count :] = 2
+    else:
+        role_idx[guide_start:] = 2
+
+    w = role_weight.to(device=x.device, dtype=x.dtype)   # [3, 128]
+    injection = w[role_idx] * strength                    # [seq_len, 128]
+    return x + injection.unsqueeze(0)                     # broadcast over B
+
+
+# ---------------------------------------------------------------------------
+# Patched _process_input  (mirrors comfy internals, adds role injection)
+# ---------------------------------------------------------------------------
+
+def _ea_video_process_input(self, x, keyframe_idxs, denoise_mask, kwargs):
+    from comfy.ldm.lightricks.model import latent_to_pixel_coords
+
+    additional_args = {"orig_shape": list(x.shape)}
+    x, latent_coords = self.patchifier.patchify(x)
+    pixel_coords = latent_to_pixel_coords(
+        latent_coords=latent_coords,
+        scale_factors=self.vae_scale_factors,
+        causal_fix=self.causal_temporal_positioning,
+    )
+
+    if keyframe_idxs is not None:
+        additional_args["orig_patchified_shape"] = list(x.shape)
+        denoise_mask_p = self.patchifier.patchify(denoise_mask)[0]
+        grid_mask = ~torch.any(denoise_mask_p < 0, dim=-1)[0]
+        additional_args["grid_mask"] = grid_mask
+        x = x[:, grid_mask, :]
+        denoise_mask_p = denoise_mask_p[:, grid_mask, :]
+        pixel_coords = pixel_coords[:, :, grid_mask, ...]
+
+        kf_grid_mask = grid_mask[-keyframe_idxs.shape[2]:]
+        guide_entries = kwargs.get("guide_attention_entries")
+        if guide_entries:
+            total_pfc = sum(e["pre_filter_count"] for e in guide_entries)
+            if total_pfc != len(kf_grid_mask):
+                raise ValueError(
+                    f"guide pre_filter_counts ({total_pfc}) != "
+                    f"keyframe grid mask length ({len(kf_grid_mask)})"
+                )
+            resolved, offset = [], 0
+            for entry in guide_entries:
+                pfc = entry["pre_filter_count"]
+                surviving = int(kf_grid_mask[offset : offset + pfc].sum().item())
+                resolved.append({**entry, "surviving_count": surviving})
+                offset += pfc
+            additional_args["resolved_guide_entries"] = resolved
+
+        keyframe_idxs = keyframe_idxs[..., kf_grid_mask, :]
+        pixel_coords[:, :, -keyframe_idxs.shape[2] :, :] = keyframe_idxs
+        additional_args["num_guide_tokens"] = keyframe_idxs.shape[2]
+
+    role_weight = kwargs.get(_KW_ROLE_WEIGHT)
+    app_latents = int(kwargs.get(_KW_APP_LATENTS, 1))
+    role_strength = float(kwargs.get(_KW_ROLE_STRENGTH, 1.0))
+
+    # Pre-proj injection (128-dim token space, matching training)
+    x = _role_inject_tokens(x, additional_args, role_weight, app_latents, role_strength)
+    x = self.patchify_proj(x)
+
+    return x, pixel_coords, additional_args
+
+
+def _patch_process_input_once(ltxv_model):
+    """Monkey-patch _process_input. Idempotent."""
+    if getattr(ltxv_model, "_ea_process_input_patched", False):
+        return
+
+    is_av = type(ltxv_model).__name__ == "LTXAVModel"
+    original = ltxv_model._process_input
+
+    def patched(self, x, keyframe_idxs, denoise_mask, **kwargs):
+        if kwargs.get(_KW_ROLE_WEIGHT) is None:
+            return original(x, keyframe_idxs, denoise_mask, **kwargs)
+
+        if is_av and isinstance(x, list):
+            audio_length = kwargs.get("audio_length", 0)
+            vx, ax = self.separate_audio_and_video_latents(x, audio_length)
+
+            has_spatial_mask = False
+            if denoise_mask is not None:
+                for fi in range(denoise_mask.shape[2]):
+                    fm = denoise_mask[0, 0, fi]
+                    if fm.numel() > 0 and fm.min() != fm.max():
+                        has_spatial_mask = True
+                        break
+
+            vx, v_pixel_coords, additional_args = _ea_video_process_input(
+                self, vx, keyframe_idxs, denoise_mask, kwargs
+            )
+            additional_args["has_spatial_mask"] = has_spatial_mask
+
+            ax, a_latent_coords = self.a_patchifier.patchify(ax)
+
+            ref_audio = kwargs.get("ref_audio")
+            if ref_audio is not None:
+                ref_tokens = ref_audio["tokens"].to(dtype=ax.dtype, device=ax.device)
+                if ref_tokens.shape[0] < ax.shape[0]:
+                    ref_tokens = ref_tokens.expand(ax.shape[0], -1, -1)
+                ref_audio_seq_len = ref_tokens.shape[1]
+                B = ax.shape[0]
+                p = self.a_patchifier
+                tpl = p.hop_length * p.audio_latent_downsample_factor / p.sample_rate
+                ref_start = p._get_audio_latent_time_in_sec(0, ref_audio_seq_len, torch.float32, ax.device)
+                ref_end   = p._get_audio_latent_time_in_sec(1, ref_audio_seq_len + 1, torch.float32, ax.device)
+                time_offset = ref_end[-1].item() + tpl
+                ref_start = (ref_start - time_offset).unsqueeze(0).expand(B, -1).unsqueeze(1)
+                ref_end   = (ref_end   - time_offset).unsqueeze(0).expand(B, -1).unsqueeze(1)
+                ref_pos   = torch.stack([ref_start, ref_end], dim=-1)
+                additional_args["ref_audio_seq_len"] = ref_audio_seq_len
+                additional_args["target_audio_seq_len"] = ax.shape[1]
+                ax = torch.cat([ref_tokens, ax], dim=1)
+                a_latent_coords = torch.cat([ref_pos.to(a_latent_coords), a_latent_coords], dim=2)
+
+            ax = self.audio_patchify_proj(ax)
+            return [vx, ax], [v_pixel_coords, a_latent_coords], additional_args
+
+        return _ea_video_process_input(self, x, keyframe_idxs, denoise_mask, kwargs)
+
+    ltxv_model._process_input = types.MethodType(patched, ltxv_model)
+    ltxv_model._ea_process_input_patched = True
+    logger.info("EA process_input patch installed on %s", type(ltxv_model).__name__)
+
+
+# ---------------------------------------------------------------------------
+# AdaLN patch  (_prepare_timestep)
+# ---------------------------------------------------------------------------
+
+def _patch_prepare_timestep_once(ltxv_model):
+    """Monkey-patch _prepare_timestep to add ref_cond. Idempotent."""
+    if getattr(ltxv_model, "_ea_prepare_timestep_patched", False):
+        return
+
+    original = ltxv_model._prepare_timestep
+
+    def patched(self, timestep, batch_size, hidden_dtype, **kwargs):
+        t, emb_t, prompt_t = original(timestep, batch_size, hidden_dtype, **kwargs)
+        ref_cond = kwargs.get(_KW_ADALN_COND)
+        if ref_cond is not None:
+            # LTXAVModel: t = [v_timestep, a_timestep, cross_ss, v_prompt_t, a_prompt_t]
+            # LTXVModel:  t = CompressedTimestep or plain tensor
+            av_mode = isinstance(t, (list, tuple))
+            v_t = t[0] if av_mode else t
+
+            # CompressedTimestep stores .data = [B, frames, feature_dim]
+            if hasattr(v_t, "data") and not isinstance(v_t, torch.Tensor):
+                tdata = v_t.data
+                rc = ref_cond.to(device=tdata.device, dtype=tdata.dtype)
+                if rc.shape[0] < batch_size:
+                    rc = rc.expand(batch_size, -1)
+                pre_norm = tdata.norm().item()
+                v_t.data = tdata + rc.unsqueeze(1)   # [B,F,D] + [B,1,D]
+                post_norm = v_t.data.norm().item()
+                if not getattr(self, "_ea_adaln_logged", False):
+                    print(f"[EA AdaLN] timestep_norm: {pre_norm:.2f} → {post_norm:.2f}  Δ={post_norm-pre_norm:+.4f}  rc_norm={rc.norm().item():.4f}")
+                    self._ea_adaln_logged = True
+            else:
+                rc = ref_cond.to(device=v_t.device, dtype=v_t.dtype)
+                if rc.shape[0] < batch_size:
+                    rc = rc.expand(batch_size, -1)
+                v_t = v_t + rc.unsqueeze(1)
+                if av_mode:
+                    t = [v_t] + list(t[1:])
+                else:
+                    t = v_t
+        return t, emb_t, prompt_t
+
+    ltxv_model._prepare_timestep = types.MethodType(patched, ltxv_model)
+    ltxv_model._ea_prepare_timestep_patched = True
+    logger.info("EA prepare_timestep patch installed on %s", type(ltxv_model).__name__)
+
+
+# ---------------------------------------------------------------------------
+# LTXVEditAnythingApply — the one node to rule them all
+# ---------------------------------------------------------------------------
+
+class LTXVEditAnythingApply:
+    """Unified Edit Anything conditioning for video_to_video_ref_adaln LoRAs.
+
+    Applies all 3 conditioning signals from a single LoRA checkpoint in one node:
+
+    ① IC-LoRA sequence
+        Encodes the reference image and optional guide video, appends them to
+        the latent as clean conditioning frames. Layout in the transformer:
+          [target tokens | ref tokens @ t=-1 | guide tokens @ t=0..T]
+
+    ② Role embedding  (role_embedding.embedding.weight[0])
+        Adds a learned 128-dim fingerprint to the ref image tokens before
+        patchify_proj, so the model can distinguish @reference from guide frames
+        via self-attention.
+
+    ③ AdaLN conditioning  (ref_adaln_proj: fc1 → SiLU → proj)
+        Pools the ref image latent (mean + max → 256-dim), projects through a
+        2-layer MLP to the AdaLN timestep space, and adds it to every
+        transformer block's timestep bias — a persistent global appearance anchor.
+
+    Connect AFTER the standard LoRA loader, BEFORE the KSampler.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model":     ("MODEL",),
+                "positive":  ("CONDITIONING",),
+                "negative":  ("CONDITIONING",),
+                "vae":       ("VAE",),
+                "latent":    ("LATENT",),
+                "ref_image": ("IMAGE", {
+                    "tooltip": "Reference image for appearance. Needs to be a clean image, aligned and facing the camera.",
+                }),
+                "resize_mode": (["pad_to_fit", "center_crop", "stretch"], {
+                    "default": "pad_to_fit",
+                    "tooltip": "How to resize the reference image to match the video's resolution. 'pad_to_fit' avoids distortion.",
+                }),
+                "lora_name": (folder_paths.get_filename_list("loras"), {
+                    "tooltip": "LoRA trained with the video_to_video_ref_adaln strategy.",
+                }),
+            },
+            "optional": {
+                "guide_frames": ("IMAGE", {
+                    "tooltip": "Guide video frames for structure/motion. "
+                               "Leave disconnected for appearance-only (no guide).",
+                }),
+                "guide_strength": ("FLOAT", {
+                    "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "IC-LoRA conditioning strength for guide video tokens. "
+                               "Capped at 1.0 — values >1 cause ComfyUI to filter tokens out.",
+                }),
+                "ref_strength": ("FLOAT", {
+                    "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "IC-LoRA conditioning strength for ref image tokens. "
+                               "Capped at 1.0 — values >1 cause ComfyUI to filter tokens out.",
+                }),
+                "role_strength": ("FLOAT", {
+                    "default": 1.0, "min": 0.0, "max": 20.0, "step": 0.1,
+                    "tooltip": "Strength of the 'Latent Fingerprint' (Role Embedding) injected into reference image tokens. "
+                               "Helps Attention find the reference in the latent space. Increase if the model ignores the reference.",
+                }),
+                "adaln_scale": ("FLOAT", {
+                    "default": 1.0, "min": 0.0, "max": 10.0, "step": 0.05,
+                    "tooltip": "Global Style Bias Multiplier (AdaLN). Sets the weight of global colors/textures. "
+                               "Start around 1.0 unless the checkpoint was trained with a different ref_cond_scale.",
+                }),
+                "enable_adaln": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Inject global style anchor (AdaLN). Toggle off to see only shape transfer via IC-LoRA (Self-Attention).",
+                }),
+                "enable_role_embedding": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Inject identifying tag into ref image. Toggle off to test if the model suffers from Modality Collapse and finds the reference unassisted.",
+                }),
+                "debug": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Print latent shapes and token counts to console.",
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("MODEL", "CONDITIONING", "CONDITIONING", "LATENT", "IMAGE")
+    RETURN_NAMES = ("model", "positive", "negative", "latent", "ref_image_preview")
+    FUNCTION = "apply"
+    CATEGORY = "LTXV/EditAnything"
+
+    def apply(
+        self, model, positive, negative, vae, latent, ref_image, lora_name, resize_mode="pad_to_fit",
+        guide_frames=None, guide_strength=1.0, ref_strength=1.0,
+        role_strength=1.0, adaln_scale=1.0, enable_adaln=True, enable_role_embedding=True, debug=False,
+    ):
+        import comfy.utils
+        import comfy_extras.nodes_lt as nodes_lt
+
+        lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
+        sd = load_file(lora_path)
+
+        # ── ① Load weights from LoRA ─────────────────────────────────────────
+        # Role embedding: new format [N_slots, 128]
+        role_weight = None
+        if "role_embedding.embedding.weight" in sd:
+            emb = sd["role_embedding.embedding.weight"]   # [N, 128]
+            padded = torch.zeros(3, emb.shape[1], dtype=emb.dtype)
+            padded[1] = emb[0]   # slot 0 → appearance (role 1)
+            role_weight = padded
+            logger.info("Role embedding: shape=%s → appearance role", tuple(emb.shape))
+        else:
+            for k in ("role_embedding.weight", "_role_embedding.weight",
+                      "diffusion_model.role_embedding.weight"):
+                if k in sd:
+                    role_weight = sd[k]
+                    logger.info("Role embedding (legacy key '%s'): shape=%s", k, tuple(role_weight.shape))
+                    break
+
+        # AdaLN projector
+        proj_w = sd.get("ref_adaln_proj.proj.weight")
+        proj_b = sd.get("ref_adaln_proj.proj.bias")
+        fc1_w  = sd.get("ref_adaln_proj.fc1.weight")
+        fc1_b  = sd.get("ref_adaln_proj.fc1.bias")
+        has_adaln = proj_w is not None and proj_b is not None
+        has_fc1   = fc1_w  is not None and fc1_b  is not None
+
+        # ── ② Build IC-LoRA sequence ─────────────────────────────────────────
+        scale_factors = vae.downscale_index_formula
+        time_sf, w_sf, h_sf = scale_factors
+
+        latent_image = latent["samples"]                 # [B, C, F, H_lat, W_lat]
+        noise_mask   = nodes_lt.get_noise_mask(latent)
+
+        _, _, F_target, lat_h, lat_w = latent_image.shape
+        px_h = lat_h * h_sf
+        px_w = lat_w * w_sf
+
+        # Encode guide video (optional)
+        guide_lat = None
+        if guide_frames is not None:
+            gf = comfy.utils.common_upscale(
+                guide_frames.movedim(-1, 1), px_w, px_h, "bilinear", "disabled"
+            ).movedim(1, -1)[:, :, :, :3]
+            n_guide = (gf.shape[0] - 1) // time_sf * time_sf + 1
+            guide_lat = vae.encode(gf[:n_guide])
+
+        # Encode ref image at the same spatial resolution as the target latent
+        ref_px = ref_image[0:1]
+        if resize_mode == "stretch":
+            ref_px = comfy.utils.common_upscale(
+                ref_px.movedim(-1, 1), px_w, px_h, "bilinear", "disabled"
+            ).movedim(1, -1)[:, :, :, :3]
+        elif resize_mode == "center_crop":
+            ref_px = comfy.utils.common_upscale(
+                ref_px.movedim(-1, 1), px_w, px_h, "bilinear", "center"
+            ).movedim(1, -1)[:, :, :, :3]
+        elif resize_mode == "pad_to_fit":
+            _, H, W, C = ref_px.shape
+            scale = min(px_w / W, px_h / H)
+            new_w = max(1, int(W * scale))
+            new_h = max(1, int(H * scale))
+            resized = torch.nn.functional.interpolate(
+                ref_px.movedim(-1, 1),
+                size=(new_h, new_w),
+                mode="bilinear",
+                align_corners=False,
+            ).movedim(1, -1)
+
+            canvas = torch.full((1, px_h, px_w, C), 0.5, dtype=ref_px.dtype, device=ref_px.device)
+            y_offset = (px_h - new_h) // 2
+            x_offset = (px_w - new_w) // 2
+            canvas[:, y_offset:y_offset + new_h, x_offset:x_offset + new_w, :] = resized
+            ref_px = canvas[:, :, :, :3]
+        ref_lat = vae.encode(ref_px)   # [1, 128, 1, lat_h, lat_w]
+
+        # Temporal position for ref: t=-1 slot → -time_sf pixel frames (BEFORE frame 0)
+        # Training layout: [ref @ t=-8 | guide @ t=0..T | noisy_target @ t=0..T]
+        ref_pixel_pos = -time_sf   # = -8 for LTX VAE (one latent frame before frame 0)
+
+        # Append ref first (entry[0] = appearance)
+        # causal_fix=True matches training validation_sampler.py:418 (get_pixel_coords causal_fix=True)
+        positive, negative, latent_image, noise_mask = nodes_lt.LTXVAddGuide.append_keyframe(
+            positive, negative, ref_pixel_pos, latent_image, noise_mask,
+            ref_lat, ref_strength, scale_factors, causal_fix=True,
+        )
+        positive, negative = nodes_lt._append_guide_attention_entry(
+            positive, negative,
+            ref_lat.shape[2] * ref_lat.shape[3] * ref_lat.shape[4],
+            list(ref_lat.shape[2:]),
+            strength=ref_strength,
+        )
+
+        # Append guide second (entry[1] = motion)
+        if guide_lat is not None:
+            positive, negative, latent_image, noise_mask = nodes_lt.LTXVAddGuide.append_keyframe(
+                positive, negative, 0, latent_image, noise_mask,
+                guide_lat, guide_strength, scale_factors, causal_fix=True,
+            )
+            positive, negative = nodes_lt._append_guide_attention_entry(
+                positive, negative,
+                guide_lat.shape[2] * guide_lat.shape[3] * guide_lat.shape[4],
+                list(guide_lat.shape[2:]),
+                strength=guide_strength,
+            )
+
+        # ── ③ Patch model (role embedding + AdaLN) ──────────────────────────
+        m = model.clone()
+        ltxv = _find_ltxv_model(m.model)
+        if ltxv is None:
+            raise ValueError(
+                "LTXVEditAnythingApply: could not locate LTXVModel inside the MODEL wrapper."
+            )
+
+        m.model_options = dict(m.model_options)
+        to = dict(m.model_options.get("transformer_options", {}))
+
+        if role_weight is not None and enable_role_embedding:
+            _patch_process_input_once(ltxv)
+            to[_KW_ROLE_WEIGHT]   = role_weight
+            to[_KW_APP_LATENTS]   = 1          # 1 ref image frame
+            to[_KW_ROLE_STRENGTH] = float(role_strength)
+
+        if has_adaln and enable_adaln:
+            B = ref_lat.shape[0]
+            flat = ref_lat.reshape(B, 128, -1).float()
+            ref_mean = flat.mean(dim=-1)
+            ref_max  = flat.max(dim=-1).values
+            dtype = proj_w.dtype
+
+            if has_fc1:
+                ref_global = torch.cat([ref_mean, ref_max], dim=-1).to(dtype=dtype)
+                h = F.silu(F.linear(ref_global, fc1_w.to(dtype=dtype), fc1_b.to(dtype=dtype)))
+                ref_cond = F.linear(h, proj_w, proj_b)
+            else:
+                ref_cond = F.linear(ref_mean.to(dtype=dtype), proj_w, proj_b)
+
+            ref_cond = ref_cond * adaln_scale
+            _patch_prepare_timestep_once(ltxv)
+            to[_KW_ADALN_COND] = ref_cond
+            logger.info("AdaLN cond: shape=%s, norm=%.4f", tuple(ref_cond.shape), ref_cond.norm().item())
+
+        m.model_options["transformer_options"] = to
+
+        if debug:
+            ref_toks    = ref_lat.shape[2] * ref_lat.shape[3] * ref_lat.shape[4]
+            target_toks = F_target * lat_h * lat_w
+            print("\n" + "=" * 60)
+            print("[LTXVEditAnythingApply DEBUG]")
+            print(f"  target  latent : {list(latent['samples'].shape)}  → {target_toks} tokens")
+            print(f"  ref img latent : {list(ref_lat.shape)}  → {ref_toks} tokens  (role emb: {'yes' if (role_weight is not None and enable_role_embedding) else 'no'})")
+            print(f"  ref pixel pos  : {ref_pixel_pos}  (out-of-band)")
+            if guide_lat is not None:
+                guide_toks = guide_lat.shape[2] * guide_lat.shape[3] * guide_lat.shape[4]
+                print(f"  guide   latent : {list(guide_lat.shape)}  → {guide_toks} tokens")
+            print(f"  AdaLN cond     : {'yes (2-layer MLP)' if (has_fc1 and enable_adaln) else 'yes (single linear)' if (has_adaln and enable_adaln) else 'no'}")
+            if has_adaln and enable_adaln:
+                print(f"  adaln_scale    : {adaln_scale}  → ref_cond norm={ref_cond.norm():.4f}")
+            print("=" * 60 + "\n")
+
+        return (m, positive, negative, {"samples": latent_image, "noise_mask": noise_mask}, ref_px.clone())
+
+
+# ---------------------------------------------------------------------------
+# ComfyUI registration
+# ---------------------------------------------------------------------------
+
+class LTXVApplyNeutralMask:
+    """
+    Replaces masked-out image/video regions with a clean solid background,
+    useful before feeding reference images or guide frames to LTXV conditioning.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "mask": ("MASK",),
+                "background": (["white", "neutral_gray", "black"],),
+                "hard_edges": ("BOOLEAN", {"default": True}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+    FUNCTION = "apply"
+    CATEGORY = "LTXV/EditAnything"
+
+    def apply(self, image, mask, background, hard_edges):
+        img = image.clone()
+        m = mask
+
+        if m.dim() == 2:
+            m = m.unsqueeze(0)
+
+        if m.shape[0] == 1 and img.shape[0] > 1:
+            m = m.expand(img.shape[0], -1, -1)
+        elif m.shape[0] > img.shape[0]:
+            m = m[:img.shape[0]]
+        elif m.shape[0] < img.shape[0]:
+            last_frame = m[-1:]
+            padding = last_frame.expand(img.shape[0] - m.shape[0], -1, -1)
+            m = torch.cat([m, padding], dim=0)
+
+        _, H, W, _ = img.shape
+        m = m.unsqueeze(1)
+        if hard_edges:
+            m = torch.nn.functional.interpolate(m.float(), size=(H, W), mode="nearest")
+            m = (m > 0.5).to(img.dtype)
+        else:
+            m = torch.nn.functional.interpolate(m.float(), size=(H, W), mode="bilinear", align_corners=False)
+            m = m.clamp(0.0, 1.0).to(img.dtype)
+        m = m.movedim(1, -1).to(img.device, dtype=img.dtype)
+
+        colors = {
+            "white": [1.0, 1.0, 1.0],
+            "neutral_gray": [0.5, 0.5, 0.5],
+            "black": [0.0, 0.0, 0.0],
+        }
+        bg_color = torch.tensor(colors[background], device=img.device, dtype=img.dtype)
+        img = img * m + bg_color * (1.0 - m)
+        return (img,)
+
+
+class LTXVResizeReferenceByMask:
+    """
+    Resizes a reference object on a clean canvas using a mask bbox as the
+    desired object dimensions. The mask position is ignored; only its width and
+    height define the target scale.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "ref_image": ("IMAGE",),
+                "size_mask": ("MASK",),
+                "fit": (["contain", "cover", "stretch"],),
+                "background": (["white", "neutral_gray", "black"],),
+                "padding": ("INT", {"default": 0, "min": -256, "max": 256, "step": 1}),
+                "hard_edges": ("BOOLEAN", {"default": True}),
+            },
+            "optional": {
+                "ref_mask": ("MASK",),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK")
+    RETURN_NAMES = ("image", "object_mask")
+    FUNCTION = "apply"
+    CATEGORY = "LTXV/EditAnything"
+
+    @staticmethod
+    def _bbox(mask):
+        ys, xs = torch.where(mask > 0.5)
+        if ys.numel() == 0 or xs.numel() == 0:
+            return None
+        return int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
+
+    @staticmethod
+    def _fit_size(src_w, src_h, dst_w, dst_h, fit):
+        if fit == "stretch":
+            return max(1, dst_w), max(1, dst_h)
+        scale_w = dst_w / max(1, src_w)
+        scale_h = dst_h / max(1, src_h)
+        scale = max(scale_w, scale_h) if fit == "cover" else min(scale_w, scale_h)
+        return max(1, int(round(src_w * scale))), max(1, int(round(src_h * scale)))
+
+    def apply(self, ref_image, size_mask, fit, background, padding, hard_edges, ref_mask=None):
+        ref = ref_image[0:1, :, :, :3]
+        size = size_mask[0] if size_mask.dim() == 3 else size_mask
+        out_h, out_w = int(size.shape[-2]), int(size.shape[-1])
+
+        colors = {
+            "white": [1.0, 1.0, 1.0],
+            "neutral_gray": [0.5, 0.5, 0.5],
+            "black": [0.0, 0.0, 0.0],
+        }
+        canvas = torch.tensor(colors[background], device=ref.device, dtype=ref.dtype).view(1, 1, 1, 3)
+        canvas = canvas.expand(1, out_h, out_w, 3).clone()
+        out_mask = torch.zeros((1, out_h, out_w), device=ref.device, dtype=ref.dtype)
+
+        size_bbox = self._bbox(size.to(ref.device))
+        if size_bbox is None:
+            return (canvas, out_mask)
+
+        sx_mask0, sy_mask0, sx_mask1, sy_mask1 = size_bbox
+        dst_w = max(1, sx_mask1 - sx_mask0 + (int(padding) * 2))
+        dst_h = max(1, sy_mask1 - sy_mask0 + (int(padding) * 2))
+        dst_w = min(out_w, dst_w)
+        dst_h = min(out_h, dst_h)
+
+        if ref_mask is not None:
+            rm = ref_mask[0] if ref_mask.dim() == 3 else ref_mask
+            rm = rm.to(device=ref.device, dtype=ref.dtype)
+            if rm.shape[-2:] != ref.shape[1:3]:
+                rm = torch.nn.functional.interpolate(
+                    rm.unsqueeze(0).unsqueeze(0).float(),
+                    size=ref.shape[1:3],
+                    mode="nearest" if hard_edges else "bilinear",
+                    align_corners=False if not hard_edges else None,
+                )[0, 0].to(dtype=ref.dtype)
+            if hard_edges:
+                rm = (rm > 0.5).to(ref.dtype)
+            else:
+                rm = rm.clamp(0.0, 1.0)
+            src_bbox = self._bbox(rm)
+        else:
+            rm = torch.ones((ref.shape[1], ref.shape[2]), device=ref.device, dtype=ref.dtype)
+            src_bbox = (0, 0, ref.shape[2], ref.shape[1])
+
+        if src_bbox is None:
+            return (canvas, out_mask)
+
+        sx0, sy0, sx1, sy1 = src_bbox
+        obj = ref[:, sy0:sy1, sx0:sx1, :]
+        obj_mask = rm[sy0:sy1, sx0:sx1].unsqueeze(0).unsqueeze(0)
+        src_h, src_w = obj.shape[1], obj.shape[2]
+        new_w, new_h = self._fit_size(src_w, src_h, dst_w, dst_h, fit)
+
+        obj_rs = torch.nn.functional.interpolate(
+            obj.movedim(-1, 1),
+            size=(new_h, new_w),
+            mode="bilinear",
+            align_corners=False,
+        ).movedim(1, -1)
+        mask_rs = torch.nn.functional.interpolate(
+            obj_mask.float(),
+            size=(new_h, new_w),
+            mode="nearest" if hard_edges else "bilinear",
+            align_corners=False if not hard_edges else None,
+        )
+        if hard_edges:
+            mask_rs = (mask_rs > 0.5).to(ref.dtype)
+        else:
+            mask_rs = mask_rs.clamp(0.0, 1.0).to(ref.dtype)
+
+        paste_x0 = (out_w - new_w) // 2
+        paste_y0 = (out_h - new_h) // 2
+        src_x0 = max(0, -paste_x0)
+        src_y0 = max(0, -paste_y0)
+        paste_x0 = max(0, paste_x0)
+        paste_y0 = max(0, paste_y0)
+        paste_x1 = min(out_w, paste_x0 + new_w - src_x0)
+        paste_y1 = min(out_h, paste_y0 + new_h - src_y0)
+        src_x1 = src_x0 + (paste_x1 - paste_x0)
+        src_y1 = src_y0 + (paste_y1 - paste_y0)
+
+        if paste_x1 <= paste_x0 or paste_y1 <= paste_y0:
+            return (canvas, out_mask)
+
+        alpha = mask_rs[:, :, src_y0:src_y1, src_x0:src_x1].movedim(1, -1)
+        patch = obj_rs[:, src_y0:src_y1, src_x0:src_x1, :]
+        canvas[:, paste_y0:paste_y1, paste_x0:paste_x1, :] = (
+            patch * alpha + canvas[:, paste_y0:paste_y1, paste_x0:paste_x1, :] * (1.0 - alpha)
+        )
+        out_mask[:, paste_y0:paste_y1, paste_x0:paste_x1] = torch.maximum(
+            out_mask[:, paste_y0:paste_y1, paste_x0:paste_x1],
+            alpha[..., 0],
+        )
+        return (canvas, out_mask)
+
+
+NODE_CLASS_MAPPINGS = {
+    "LTXVEditAnythingApply": LTXVEditAnythingApply,
+    "LTXVApplyNeutralMask": LTXVApplyNeutralMask,
+    "LTXVResizeReferenceByMask": LTXVResizeReferenceByMask,
+}
+
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "LTXVEditAnythingApply": "LTXV Edit Anything (Apply)",
+    "LTXVApplyNeutralMask": "LTXV Apply Neutral Mask",
+    "LTXVResizeReferenceByMask": "LTXV Resize Reference By Mask",
+}
