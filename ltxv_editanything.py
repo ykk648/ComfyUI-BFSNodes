@@ -463,15 +463,15 @@ class LTXVEditAnythingApply:
                 "ref_image": ("IMAGE", {
                     "tooltip": "Reference image for appearance. Needs to be a clean image, aligned and facing the camera.",
                 }),
-                "editanything_module": ("LTXV_EA_MODULE", {
-                    "tooltip": "Sidecar module loaded by LTXV Edit Anything Module Loader.",
-                }),
                 "resize_mode": (["pad_to_fit", "center_crop", "stretch"], {
                     "default": "pad_to_fit",
                     "tooltip": "How to resize the reference image to match the video's resolution. 'pad_to_fit' avoids distortion.",
                 }),
             },
             "optional": {
+                "editanything_module": ("LTXV_EA_MODULE", {
+                    "tooltip": "Optional sidecar module loaded by LTXV Edit Anything Module Loader. If disconnected, role embedding and AdaLN conditioning are skipped.",
+                }),
                 "guide_frames": ("IMAGE", {
                     "tooltip": "Guide video frames for structure/motion. "
                                "Leave disconnected for appearance-only (no guide).",
@@ -517,14 +517,15 @@ class LTXVEditAnythingApply:
     CATEGORY = "LTXV/EditAnything"
 
     def apply(
-        self, model, positive, negative, vae, latent, ref_image, editanything_module, resize_mode="pad_to_fit",
+        self, model, positive, negative, vae, latent, ref_image, resize_mode="pad_to_fit",
         guide_frames=None, guide_strength=1.0, ref_strength=1.0,
         role_strength=1.0, adaln_scale=1.0, enable_adaln=True, enable_role_embedding=True, debug=False,
+        editanything_module=None,
     ):
         import comfy.utils
         import comfy_extras.nodes_lt as nodes_lt
 
-        sd = editanything_module["state_dict"]
+        sd = editanything_module["state_dict"] if editanything_module is not None else {}
 
         # ── ① Load weights from LoRA ─────────────────────────────────────────
         # Role embedding: new format [N_slots, 128]
