@@ -1,7 +1,7 @@
 [project]
 name = "bfsnodes"
-description = "Custom ComfyUI nodes including LTXV Edit Anything and Head-Swap Bernini conditioning helpers."
-version = "1.5.0"
+description = "Custom ComfyUI nodes including LTXV Edit Anything, Head-Swap and Anime2Real Bernini conditioning helpers."
+version = "1.6.0"
 license = {file = "LICENSE"} 
 dependencies = [
     "torch",
