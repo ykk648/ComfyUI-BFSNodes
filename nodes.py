@@ -1,4 +1,8 @@
+import logging
 import math
+import os
+
+import numpy as np
 import torch
 from PIL import Image
 
@@ -10,6 +14,367 @@ from .util import (
     paste_with_alpha,
     add_white_padding,
 )
+
+
+log = logging.getLogger("BFS.Nodes")
+_INSIGHTFACE_APP = None
+_INSIGHTFACE_UNAVAILABLE = False
+
+
+def _clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+def _parse_rgb_color(value, default=(255, 255, 255)):
+    try:
+        parts = [int(x.strip()) for x in str(value).split(",")]
+        if len(parts) != 3:
+            return default
+        return tuple(_clamp(p, 0, 255) for p in parts)
+    except Exception:
+        return default
+
+
+def _select_face_box(boxes, selection, image_w, image_h):
+    if not boxes:
+        return None
+
+    def area(item):
+        x1, y1, x2, y2 = item["bbox"]
+        return max(0.0, x2 - x1) * max(0.0, y2 - y1)
+
+    if selection == "leftmost":
+        return min(boxes, key=lambda item: (item["bbox"][0] + item["bbox"][2]) * 0.5)
+    if selection == "rightmost":
+        return max(boxes, key=lambda item: (item["bbox"][0] + item["bbox"][2]) * 0.5)
+    if selection == "center":
+        cx0, cy0 = image_w * 0.5, image_h * 0.38
+
+        def center_distance(item):
+            x1, y1, x2, y2 = item["bbox"]
+            cx = (x1 + x2) * 0.5
+            cy = (y1 + y2) * 0.5
+            return (cx - cx0) ** 2 + (cy - cy0) ** 2
+
+        return min(boxes, key=center_distance)
+
+    return max(boxes, key=area)
+
+
+def _get_insightface_app(det_size):
+    global _INSIGHTFACE_APP, _INSIGHTFACE_UNAVAILABLE
+
+    if _INSIGHTFACE_UNAVAILABLE:
+        return None
+    if _INSIGHTFACE_APP is not None:
+        return _INSIGHTFACE_APP
+
+    model_root = os.path.expanduser("~/.insightface")
+    det_model = os.path.join(model_root, "models", "buffalo_l", "det_10g.onnx")
+    if not os.path.exists(det_model):
+        _INSIGHTFACE_UNAVAILABLE = True
+        return None
+
+    try:
+        from insightface.app import FaceAnalysis
+
+        app = FaceAnalysis(name="buffalo_l", root=model_root, allowed_modules=["detection"])
+        app.prepare(ctx_id=-1, det_size=(int(det_size), int(det_size)))
+        _INSIGHTFACE_APP = app
+        return app
+    except Exception as exc:
+        _INSIGHTFACE_UNAVAILABLE = True
+        log.warning("InsightFace detector unavailable, falling back to OpenCV: %s", exc)
+        return None
+
+
+def _detect_faces_insightface(image_np, det_size, min_confidence):
+    app = _get_insightface_app(det_size)
+    if app is None:
+        return []
+
+    try:
+        image_bgr = image_np[:, :, ::-1].copy()
+        faces = app.get(image_bgr)
+    except Exception as exc:
+        log.warning("InsightFace detection failed, falling back to OpenCV: %s", exc)
+        return []
+
+    h, w = image_np.shape[:2]
+    boxes = []
+    for face in faces:
+        score = float(getattr(face, "det_score", 1.0))
+        if score < min_confidence:
+            continue
+        x1, y1, x2, y2 = [float(v) for v in face.bbox[:4]]
+        x1 = _clamp(x1, 0.0, float(w - 1))
+        y1 = _clamp(y1, 0.0, float(h - 1))
+        x2 = _clamp(x2, x1 + 1.0, float(w))
+        y2 = _clamp(y2, y1 + 1.0, float(h))
+        boxes.append({"bbox": (x1, y1, x2, y2), "score": score, "source": "insightface"})
+    return boxes
+
+
+def _detect_faces_opencv(image_np, min_face_size_pct):
+    try:
+        import cv2
+    except Exception:
+        return []
+
+    h, w = image_np.shape[:2]
+    gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
+    min_size = max(12, int(min(w, h) * max(0.0, min_face_size_pct) / 100.0))
+    cascade_names = [
+        "haarcascade_frontalface_alt2.xml",
+        "haarcascade_frontalface_default.xml",
+        "haarcascade_profileface.xml",
+    ]
+    boxes = []
+
+    for name in cascade_names:
+        path = os.path.join(cv2.data.haarcascades, name)
+        cascade = cv2.CascadeClassifier(path)
+        if cascade.empty():
+            continue
+
+        detections = cascade.detectMultiScale(
+            gray,
+            scaleFactor=1.08,
+            minNeighbors=4,
+            minSize=(min_size, min_size),
+            flags=cv2.CASCADE_SCALE_IMAGE,
+        )
+        for x, y, bw, bh in detections:
+            boxes.append({
+                "bbox": (float(x), float(y), float(x + bw), float(y + bh)),
+                "score": 0.5,
+                "source": f"opencv:{name}",
+            })
+
+        if name == "haarcascade_profileface.xml":
+            flipped = cv2.flip(gray, 1)
+            detections = cascade.detectMultiScale(
+                flipped,
+                scaleFactor=1.08,
+                minNeighbors=4,
+                minSize=(min_size, min_size),
+                flags=cv2.CASCADE_SCALE_IMAGE,
+            )
+            for x, y, bw, bh in detections:
+                boxes.append({
+                    "bbox": (float(w - x - bw), float(y), float(w - x), float(y + bh)),
+                    "score": 0.5,
+                    "source": "opencv:profile_flipped",
+                })
+
+    return boxes
+
+
+def _fallback_head_box(image_w, image_h):
+    side = min(image_w, max(1, int(round(image_h * 0.55))))
+    cx = image_w * 0.5
+    cy = image_h * 0.28
+    x1 = cx - side * 0.5
+    y1 = cy - side * 0.38
+    return (x1, y1, x1 + side, y1 + side)
+
+
+def _fit_square_box_to_image(crop_box, image_w, image_h):
+    left, top, right, bottom = [float(v) for v in crop_box]
+    side = max(1.0, right - left, bottom - top)
+    side = min(side, float(max(1, min(image_w, image_h))))
+
+    cx = (left + right) * 0.5
+    cy = (top + bottom) * 0.5
+    left = cx - side * 0.5
+    top = cy - side * 0.5
+    right = left + side
+    bottom = top + side
+
+    if left < 0:
+        right -= left
+        left = 0.0
+    if top < 0:
+        bottom -= top
+        top = 0.0
+    if right > image_w:
+        left -= right - image_w
+        right = float(image_w)
+    if bottom > image_h:
+        top -= bottom - image_h
+        bottom = float(image_h)
+
+    left = _clamp(left, 0.0, float(image_w - side))
+    top = _clamp(top, 0.0, float(image_h - side))
+    return (left, top, left + side, top + side)
+
+
+def _crop_square_with_padding(pil_img, crop_box, output_size, pad_color):
+    left, top, right, bottom = [int(round(v)) for v in crop_box]
+    side = max(1, max(right - left, bottom - top))
+    right = left + side
+    bottom = top + side
+
+    src_left = _clamp(left, 0, pil_img.width)
+    src_top = _clamp(top, 0, pil_img.height)
+    src_right = _clamp(right, 0, pil_img.width)
+    src_bottom = _clamp(bottom, 0, pil_img.height)
+
+    canvas = Image.new("RGB", (side, side), pad_color)
+    if src_right > src_left and src_bottom > src_top:
+        crop = pil_img.crop((src_left, src_top, src_right, src_bottom))
+        canvas.paste(crop, (src_left - left, src_top - top))
+
+    if output_size > 0 and canvas.size != (output_size, output_size):
+        canvas = canvas.resize((output_size, output_size), Image.LANCZOS)
+    return canvas, (left, top, right, bottom)
+
+
+# ---------------------------------------------------------------------------
+# AutoCropHeadReference
+# ---------------------------------------------------------------------------
+
+class AutoCropHeadReference:
+    """
+    Detects a face in a portrait/body photo and returns a square head reference.
+
+    Default behavior favors the local InsightFace detector when available, then
+    falls back to OpenCV Haar cascades, then to an upper-body center crop.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "detector": (
+                    ["auto", "insightface", "opencv_haar", "none"],
+                    {"default": "auto"},
+                ),
+                "face_selection": (
+                    ["largest", "center", "leftmost", "rightmost"],
+                    {"default": "largest"},
+                ),
+                "output_size": (
+                    "INT",
+                    {"default": 768, "min": 128, "max": 2048, "step": 64},
+                ),
+                "side_padding_pct": (
+                    "FLOAT",
+                    {"default": 45.0, "min": 0.0, "max": 200.0, "step": 1.0},
+                ),
+                "top_padding_pct": (
+                    "FLOAT",
+                    {"default": 35.0, "min": 0.0, "max": 200.0, "step": 1.0},
+                ),
+                "bottom_padding_pct": (
+                    "FLOAT",
+                    {"default": 35.0, "min": 0.0, "max": 300.0, "step": 1.0},
+                ),
+                "vertical_shift_pct": (
+                    "FLOAT",
+                    {"default": -5.0, "min": -100.0, "max": 100.0, "step": 1.0},
+                ),
+                "min_confidence": (
+                    "FLOAT",
+                    {"default": 0.35, "min": 0.0, "max": 1.0, "step": 0.01},
+                ),
+                "det_size": (
+                    "INT",
+                    {"default": 640, "min": 320, "max": 1280, "step": 32},
+                ),
+                "min_face_size_pct": (
+                    "FLOAT",
+                    {"default": 3.0, "min": 1.0, "max": 30.0, "step": 0.5},
+                ),
+                "pad_color": (
+                    "STRING",
+                    {"default": "255,255,255"},
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "STRING")
+    RETURN_NAMES = ("cropped_image", "debug")
+    FUNCTION = "crop"
+    CATEGORY = "BFS/image"
+
+    def crop(
+        self,
+        image,
+        detector="auto",
+        face_selection="largest",
+        output_size=768,
+        side_padding_pct=45.0,
+        top_padding_pct=35.0,
+        bottom_padding_pct=35.0,
+        vertical_shift_pct=-5.0,
+        min_confidence=0.35,
+        det_size=640,
+        min_face_size_pct=3.0,
+        pad_color="255,255,255",
+    ):
+        if len(image.shape) != 4 or image.shape[0] < 1:
+            raise ValueError("Input 'image' must be a valid IMAGE batch.")
+
+        output_size = int(output_size)
+        pad_rgb = _parse_rgb_color(pad_color)
+        out_images = []
+        debug_lines = []
+
+        for i in range(image.shape[0]):
+            pil_img = tensor_to_pil(image[i]).convert("RGB")
+            image_np = np.asarray(pil_img)
+            h, w = image_np.shape[:2]
+
+            boxes = []
+            if detector in ("auto", "insightface"):
+                boxes = _detect_faces_insightface(image_np, int(det_size), float(min_confidence))
+            if not boxes and detector in ("auto", "opencv_haar"):
+                boxes = _detect_faces_opencv(image_np, float(min_face_size_pct))
+
+            selected = _select_face_box(boxes, face_selection, w, h)
+            if selected is None or detector == "none":
+                x1, y1, x2, y2 = _fallback_head_box(w, h)
+                source = "fallback:upper_center"
+                score = 0.0
+            else:
+                x1, y1, x2, y2 = selected["bbox"]
+                source = selected["source"]
+                score = selected["score"]
+
+            face_w = max(1.0, x2 - x1)
+            face_h = max(1.0, y2 - y1)
+            rect_left = x1 - face_w * (float(side_padding_pct) / 100.0)
+            rect_right = x2 + face_w * (float(side_padding_pct) / 100.0)
+            rect_top = y1 - face_h * (float(top_padding_pct) / 100.0)
+            rect_bottom = y2 + face_h * (float(bottom_padding_pct) / 100.0)
+
+            side = max(rect_right - rect_left, rect_bottom - rect_top, 1.0)
+            cx = (rect_left + rect_right) * 0.5
+            cy = (rect_top + rect_bottom) * 0.5 + side * (float(vertical_shift_pct) / 100.0)
+            crop_box = (
+                cx - side * 0.5,
+                cy - side * 0.5,
+                cx + side * 0.5,
+                cy + side * 0.5,
+            )
+            crop_box = _fit_square_box_to_image(crop_box, w, h)
+
+            cropped, resolved_crop = _crop_square_with_padding(
+                pil_img=pil_img,
+                crop_box=crop_box,
+                output_size=output_size,
+                pad_color=pad_rgb,
+            )
+            out_images.append(pil_to_tensor(cropped))
+            debug_lines.append(
+                f"image[{i}] {w}x{h} detector={source} score={score:.3f} "
+                f"face=({x1:.1f},{y1:.1f},{x2:.1f},{y2:.1f}) "
+                f"crop={resolved_crop} output={cropped.width}x{cropped.height}"
+            )
+
+        return (torch.stack(out_images, dim=0), "\n".join(debug_lines))
 
 
 # ---------------------------------------------------------------------------
@@ -697,12 +1062,14 @@ class ReservedRegionFrameComposer:
 # ---------------------------------------------------------------------------
 
 NODE_CLASS_MAPPINGS = {
+    "BFSAutoCropHeadReference": AutoCropHeadReference,
     "ReservedRegionFrameComposer": ReservedRegionFrameComposer,
     "FrameRangedFaceLoader": FrameRangedFaceLoader,
     "FaceSequenceBatch": FaceSequenceBatch,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "BFSAutoCropHeadReference": "BFS Auto Crop Head Reference",
     "ReservedRegionFrameComposer": "Reserved Region Frame Composer",
     "FrameRangedFaceLoader": "Frame Ranged Face Loader",
     "FaceSequenceBatch": "Face Sequence Batch",
