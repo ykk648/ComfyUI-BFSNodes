@@ -285,7 +285,7 @@ def _install_patches(ltxv):
             raise
 
     def process_output(self, x, embedded_timestep, keyframe_idxs, **kw):
-        ref_len = kw.get("_id_ref_len", getattr(self, "_id_ref_len", 0))
+        ref_len = getattr(self, "_id_ref_len", 0)
         if ref_len:
             try:
                 from comfy.ldm.lightricks.av_model import CompressedTimestep
