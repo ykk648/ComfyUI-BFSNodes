@@ -2,3 +2,7 @@ torch
 numpy
 Pillow
 safetensors
+librosa
+opencv-python
+insightface==0.7.3
+onnxruntime
