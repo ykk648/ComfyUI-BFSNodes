@@ -31,7 +31,7 @@ LAYOUTS = {
 
 
 def _cover_resize_crop(img: Image.Image, size: int) -> Image.Image:
-    """Resize+center-crop to exactly fill a size x size square (no stretch)."""
+    """Resize+center-crop to exactly fill a size x size square (no stretch, crops excess)."""
     img = img.convert("RGB")
     w, h = img.size
     scale = max(size / w, size / h)
@@ -41,10 +41,27 @@ def _cover_resize_crop(img: Image.Image, size: int) -> Image.Image:
     return img.crop((x0, y0, x0 + size, y0 + size))
 
 
-def compose_sheet(imgs, panel_size=PANEL_SIZE, canvas_w=CANVAS_W, canvas_h=CANVAS_H, bg=BG_COLOR):
+def _fit_resize_pad(img: Image.Image, size: int, bg) -> Image.Image:
+    """Resize preserving aspect ratio so the WHOLE image fits inside the panel (no
+    cropping), then pad the leftover space with `bg` (letterbox/pillarbox)."""
+    img = img.convert("RGB")
+    w, h = img.size
+    scale = min(size / w, size / h)
+    nw, nh = max(1, round(w * scale)), max(1, round(h * scale))
+    img = img.resize((nw, nh), Image.LANCZOS)
+    panel = Image.new("RGB", (size, size), bg)
+    panel.paste(img, ((size - nw) // 2, (size - nh) // 2))
+    return panel
+
+
+def compose_sheet(imgs, panel_size=PANEL_SIZE, canvas_w=CANVAS_W, canvas_h=CANVAS_H, bg=BG_COLOR, fit_mode="crop"):
+    """fit_mode: 'crop' fills each panel completely (crops excess, current default,
+    matches the training data); 'fit' keeps every pixel of each reference (letterboxed
+    inside its panel) at the cost of some background padding."""
     n = len(imgs)
     if not 1 <= n <= 5:
         raise ValueError(f"expected 1-5 reference images, got {n}")
+    panel_fn = _cover_resize_crop if fit_mode == "crop" else (lambda im, sz: _fit_resize_pad(im, sz, bg))
     rows = LAYOUTS[n]
     native_w = max(rows) * panel_size
     native_h = len(rows) * panel_size
@@ -56,7 +73,7 @@ def compose_sheet(imgs, panel_size=PANEL_SIZE, canvas_w=CANVAS_W, canvas_h=CANVA
         x_offset = (native_w - row_w) // 2  # center short rows (e.g. bottom row of a 5-ref sheet)
         y = row_idx * panel_size
         for col in range(count):
-            panel = _cover_resize_crop(next(it), panel_size)
+            panel = panel_fn(next(it), panel_size)
             x = x_offset + col * panel_size
             native.paste(panel, (x, y))
 
@@ -71,7 +88,15 @@ class MultiRefSheetBuilder:
     @classmethod
     def INPUT_TYPES(cls):
         return {
-            "required": {},
+            "required": {
+                "fit_mode": (["crop", "fit"], {
+                    "default": "crop",
+                    "tooltip": "crop: zoom+center-crop to fill each panel completely (matches training data, "
+                               "may cut off edges). fit: scale each reference down to fit entirely inside its "
+                               "panel with no cropping (preserves every pixel, aspect ratio never distorted -- "
+                               "one uniform scale factor for both axes -- leftover space padded with background).",
+                }),
+            },
             "optional": {
                 "ref_image_1": ("IMAGE", {"tooltip": "image0 in the compositional prompt (anchor)."}),
                 "ref_image_2": ("IMAGE", {"tooltip": "image1."}),
@@ -89,7 +114,7 @@ class MultiRefSheetBuilder:
                    "sheet the multi-ref LoRA was trained on. Leave slots empty for fewer refs; "
                    "an empty slot is simply skipped, not padded with blank content.")
 
-    def build(self, ref_image_1=None, ref_image_2=None, ref_image_3=None,
+    def build(self, fit_mode="crop", ref_image_1=None, ref_image_2=None, ref_image_3=None,
               ref_image_4=None, ref_image_5=None):
         slots = [ref_image_1, ref_image_2, ref_image_3, ref_image_4, ref_image_5]
         provided = [s for s in slots if s is not None]
@@ -97,10 +122,11 @@ class MultiRefSheetBuilder:
             raise ValueError("MultiRefSheetBuilder needs at least one ref_image_N input.")
 
         pil_imgs = [tensor_to_pil(t[0] if t.dim() == 4 else t) for t in provided]
-        sheet = compose_sheet(pil_imgs)
+        sheet = compose_sheet(pil_imgs, fit_mode=fit_mode)
         sheet_t = pil_to_tensor(sheet).unsqueeze(0)  # [1,H,W,C]
 
-        dbg = f"MultiRefSheet | {len(provided)} refs -> {CANVAS_W}x{CANVAS_H} ({'+'.join(str(r) for r in LAYOUTS[len(provided)])} grid)"
+        dbg = (f"MultiRefSheet | {len(provided)} refs -> {CANVAS_W}x{CANVAS_H} "
+               f"({'+'.join(str(r) for r in LAYOUTS[len(provided)])} grid, fit_mode={fit_mode})")
         return (sheet_t, len(provided), dbg)
 
 
