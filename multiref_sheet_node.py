@@ -85,15 +85,66 @@ def _justified_compose(imgs, rows_counts, canvas_w, canvas_h, bg):
     return sheet
 
 
+def _cover_justified_compose(imgs, rows_counts, canvas_w, canvas_h, bg):
+    """Row-justified layout, but COVER the canvas instead of contain -- fills both
+    width and height completely, cropping the minimum necessary (like
+    _cover_resize_crop, applied to the whole grid block instead of per-panel).
+    Identical algorithm to build_multiref_sheet.py's _cover_justified_compose,
+    kept in sync so inference-time sheets match training-time sheets exactly."""
+    it = iter(imgs)
+    rows = []
+    for count in rows_counts:
+        row_imgs = [next(it) for _ in range(count)]
+        aspects = [im.width / im.height for im in row_imgs]
+        rows.append((row_imgs, aspects))
+
+    natural_heights = [canvas_w / sum(aspects) for _, aspects in rows]
+    h1 = sum(natural_heights)
+
+    if h1 >= canvas_h:
+        # overfill: each row already fills canvas_w exactly at scale=1 (by construction
+        # of natural_heights) -- keep that, crop the excess height after assembly.
+        row_heights = [round(nh) for nh in natural_heights]
+        block_w = canvas_w
+    else:
+        # underfill: scale UP so total height == canvas_h; every row becomes wider
+        # than canvas_w by that same factor -- crop the excess width after assembly.
+        scale = canvas_h / h1
+        row_heights = [round(nh * scale) for nh in natural_heights]
+        block_w = max(canvas_w, round(canvas_w * scale))
+
+    block = Image.new("RGB", (block_w, sum(row_heights)), bg)
+    y = 0
+    for (row_imgs, aspects), row_h in zip(rows, row_heights):
+        widths = [max(1, round(row_h * a)) for a in aspects]
+        row_w = sum(widths)
+        x = (block_w - row_w) // 2
+        for im, w_i in zip(row_imgs, widths):
+            resized = im.convert("RGB").resize((max(1, w_i), max(1, row_h)), Image.LANCZOS)
+            block.paste(resized, (x, y))
+            x += w_i
+        y += row_h
+
+    bw, bh = block.size
+    x0 = max(0, (bw - canvas_w) // 2)
+    y0 = max(0, (bh - canvas_h) // 2)
+    return block.crop((x0, y0, x0 + canvas_w, y0 + canvas_h))
+
+
 def compose_sheet(imgs, panel_size=PANEL_SIZE, canvas_w=CANVAS_W, canvas_h=CANVAS_H, bg=BG_COLOR, fit_mode="crop"):
     """fit_mode: 'crop' fills each fixed-size panel completely (crops excess, current
     default, matches the training data); 'fit' uses a row-justified layout that keeps
     every pixel of every reference (no cropping, no distortion) while maximizing
-    canvas coverage."""
+    canvas coverage (can underfill on one axis); 'cover' row-justifies AND fills the
+    entire canvas on both axes, cropping the minimum shared/symmetric amount needed
+    -- no background bars."""
     n = len(imgs)
     if not 1 <= n <= 5:
         raise ValueError(f"expected 1-5 reference images, got {n}")
     rows = LAYOUTS[n]
+
+    if fit_mode == "cover":
+        return _cover_justified_compose(imgs, rows, canvas_w, canvas_h, bg)
 
     if fit_mode == "fit":
         return _justified_compose(imgs, rows, canvas_w, canvas_h, bg)
@@ -124,12 +175,14 @@ class MultiRefSheetBuilder:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "fit_mode": (["crop", "fit"], {
+                "fit_mode": (["crop", "fit", "cover"], {
                     "default": "crop",
                     "tooltip": "crop: zoom+center-crop to fill each panel completely (matches training data, "
                                "may cut off edges). fit: scale each reference down to fit entirely inside its "
                                "panel with no cropping (preserves every pixel, aspect ratio never distorted -- "
-                               "one uniform scale factor for both axes -- leftover space padded with background).",
+                               "one uniform scale factor for both axes -- leftover space padded with background). "
+                               "cover: row-justified like fit, but fills the WHOLE 1536x1024 canvas on both axes "
+                               "(no background bars) by cropping the minimum shared amount needed.",
                 }),
             },
             "optional": {
