@@ -250,6 +250,20 @@ def _draw_crop_overlay(ref_img, box):
     return out
 
 
+def _apply_tass_layout(reference_positions, target_positions, layout: str):
+    """Place reference pixel-coords in a non-overlapping TASS region -- mirrors
+    ltx_trainer.training_strategies.tass.apply_tass_layout's st_drc branch (kept in sync
+    manually since this node can't import the trainer package), adapted to ComfyUI's own
+    coordinate tensor shape [B, 3 (T/H/W), N] (one corner coordinate per token) instead of
+    the trainer's [B, 3, N, 2] patch-bounds shape -- st_drc's "every axis" shift only needs
+    min/max per axis either way. layout='overlap' returns the input unchanged."""
+    if layout != "st_drc":
+        return reference_positions
+    target_extent = target_positions.amax(dim=2, keepdim=True)
+    reference_origin = reference_positions.amin(dim=2, keepdim=True)
+    return reference_positions + (target_extent - reference_origin)
+
+
 def _install_patches(ltxv):
     if getattr(ltxv, "_id_overlap_patched", False):
         return
@@ -274,6 +288,7 @@ def _install_patches(ltxv):
             rt, rlc = self.patchifier.patchify(ref_lat.to(dtype=vx.dtype, device=vx.device))
             rpc = latent_to_pixel_coords(latent_coords=rlc, scale_factors=self.vae_scale_factors,
                                          causal_fix=self.causal_temporal_positioning)
+            rpc = _apply_tass_layout(rpc, vco, getattr(self, "_id_layout", "overlap"))
             rt = self.patchify_proj(rt)
             if rt.shape[0] != vx.shape[0]:
                 rt = rt.expand(vx.shape[0], -1, -1)
@@ -460,6 +475,15 @@ class LTXIdentityOverlapConditioning:
                                         "in the top row, set 'top' instead of the default center crop so it doesn't get "
                                         "cut off. No effect on match_target_letterbox or native_resolution (neither "
                                         "ever crops)."}),
+            "layout": (["overlap", "st_drc"], {"default": "overlap",
+                       "tooltip": "New, optional -- old workflows without this input keep the default 'overlap' "
+                                  "behavior (reference shares the target's own RoPE coordinate range, distinguished "
+                                  "only by source_phase -- what every checkpoint so far was trained with). 'st_drc' "
+                                  "shifts the WHOLE reference block past the target's coordinate extent on every "
+                                  "axis (non-overlapping region) -- only use this with a checkpoint specifically "
+                                  "trained with layout='st_drc' (ltx_trainer's flexible strategy); using it with an "
+                                  "'overlap'-trained checkpoint will not work, the model never learned that "
+                                  "coordinate convention."}),
         }}
 
     RETURN_TYPES = ("MODEL", "CONDITIONING", "CONDITIONING", "LATENT", "STRING", "IMAGE", "IMAGE")
@@ -474,7 +498,7 @@ class LTXIdentityOverlapConditioning:
     def apply(self, model, positive, negative, vae, latent, reference_face,
               identity_projector="None", source_id=2.0, phase_scale=1.0, id_strength=1.0,
               arcface_mode="auto_adjust", ref_resize_mode="match_target", debug_log=False,
-              crop_anchor="center"):
+              crop_anchor="center", layout="overlap"):
         import comfy.utils
 
         global _DEBUG_ENABLED
@@ -516,6 +540,7 @@ class LTXIdentityOverlapConditioning:
         _install_patches(ltxv)
         ltxv._id_seg_value = float(source_id) * float(phase_scale)
         ltxv._id_rope_theta = 10000.0
+        ltxv._id_layout = layout
         m.model_options = dict(m.model_options)
         to = dict(m.model_options.get("transformer_options", {}))
         to["_id_ref_latent"] = ref_lat
@@ -558,7 +583,7 @@ class LTXIdentityOverlapConditioning:
             "=== LTX Identity OVERLAP (exact) ===\n"
             f"ref latent: {list(ref_lat.shape)} (encoded at {tgt_w}x{tgt_h}px, mode={ref_resize_mode}"
             f"{f', crop_anchor={crop_anchor}' if ref_resize_mode == 'match_target' else ''}) "
-            f"-> overlap tokens (frame-0 grid), source_phase seg={float(source_id)*float(phase_scale)}\n"
+            f"-> {layout} tokens, source_phase seg={float(source_id)*float(phase_scale)}\n"
             f"arcface: {arc_status} (mode={arcface_mode}) | id_strength={id_strength}\n"
             f"patches on {type(ltxv).__name__}: process_input/prepare_timestep/prepare_pe/process_output\n"
             f"crop preview: kept region {crop_box[2]}x{crop_box[3]}px of the {src_w0}x{src_h0}px reference "
