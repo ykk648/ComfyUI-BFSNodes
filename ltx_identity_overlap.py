@@ -149,7 +149,8 @@ def _rotate_ref_block(pe, start, length, seg_value, theta=10000.0):
     """Rotate RoPE freqs of tokens [start:start+length] by phase = seg_value * theta^(-d/L).
     pe = (cos, sin, [split_flag]). cos/sin shape [..., T, L] or [B,H,T,L]. Returns new pe tuple.
     One reference block's own token range gets its own seg_value (source_id*phase_scale) --
-    callers loop this once per stacked reference so each keeps its own RoPE phase tag.
+    callers loop this once per stacked reference so each keeps its own RoPE phase tag. With a
+    single reference (the common case), this is exactly the old "last ref_len tokens" rotation.
     """
     if length <= 0 or seg_value == 0.0:
         return pe
@@ -254,9 +255,10 @@ def _draw_crop_overlay(ref_img, box):
 
 # Seconds reserved per numbered strata slot -- MUST match ltx_trainer's
 # training_strategies.tass.STRATA_SLOT_WIDTH (0.5) for a strata-trained checkpoint's RoPE
-# convention to line up at inference. Slot 0 (first ref) lands at target_max_t + this value,
-# slot 1 (second ref) at target_max_t + 2*this value, etc. -- dynamic/target-relative, same
-# as st_drc's own shift, so it stays correct for whatever video length is actually generated.
+# convention to line up at inference. Slot 0 (1st ref in the batch) lands at
+# target_max_t + this value, slot 1 (2nd ref) at target_max_t + 2*this value, etc. --
+# dynamic/target-relative, same as st_drc's own shift, so it stays correct for whatever
+# video length is actually generated.
 STRATA_SLOT_WIDTH = 0.5
 
 
@@ -300,10 +302,10 @@ def _install_patches(ltxv):
     if orig_forward_internal is not None:
         def _forward_capture_fps(self, x, timestep, context, attention_mask, frame_rate=25,
                                   transformer_options={}, keyframe_idxs=None, denoise_mask=None, **kwargs):
-            # _forward calls _process_input BEFORE _prepare_positional_embeddings (which is
-            # the only other place frame_rate normally reaches) -- process_input needs it
-            # EARLIER, to convert the seconds-scale STRATA_SLOT_WIDTH into this step's raw
-            # pixel/frame units. Stash here so it's always current, never a step behind.
+            # _forward calls _process_input BEFORE _prepare_positional_embeddings (the only
+            # other place frame_rate normally reaches) -- process_input needs it EARLIER, to
+            # convert the seconds-scale STRATA_SLOT_WIDTH into this step's raw pixel/frame
+            # units. Stash here so it's always current, never a step behind.
             self._id_frame_rate = float(frame_rate)
             return orig_forward_internal(
                 x, timestep, context, attention_mask, frame_rate=frame_rate,
@@ -373,7 +375,7 @@ def _install_patches(ltxv):
                 xx, pix = vx, vco
             return xx, pix, add
         except Exception as e:
-            _dbg("ERROR process_input:", repr(e), "| out", _shape(out), "| ref_specs", len(ref_specs) if ref_specs else 0)
+            _dbg("ERROR process_input:", repr(e), "| out", _shape(out), "| n_refs", len(ref_specs) if ref_specs else 0)
             raise
 
     def prepare_timestep(self, timestep, batch_size, hidden_dtype, **kw):
@@ -492,18 +494,39 @@ def _install_patches(ltxv):
 class LTXIdentityOverlapConditioning:
     @classmethod
     def INPUT_TYPES(cls):
+        # Populate the projector dropdown from the loras folder (+ "None" = no projector).
+        try:
+            import folder_paths
+            proj_choices = ["None"] + folder_paths.get_filename_list("loras")
+        except Exception:
+            proj_choices = ["None"]
         return {"required": {
             "model": ("MODEL",),
             "positive": ("CONDITIONING",),
             "negative": ("CONDITIONING",),
             "vae": ("VAE",),
             "latent": ("LATENT",),
-            "reference_image": ("IMAGE", {
+            "reference_face": ("IMAGE", {
                              "tooltip": "Reference to copy into the generation -- any subject (object, animal, "
-                                        "character, person...), not just a face."}),
+                                        "character, person...), not just a face; name kept for backward "
+                                        "compatibility with existing workflows. Accepts a BATCH of N images (use "
+                                        "an Image Batch node to combine several) for checkpoints trained on "
+                                        "multiple STACKED references (layout='strata') -- each image in the batch "
+                                        "becomes its own reference block with source_id = source_id + its index "
+                                        "(0-based: 1st image keeps 'source_id' as-is, 2nd gets source_id+1, ...). "
+                                        "A single image (the default/old behavior) works exactly as before."}),
+            "identity_projector": (proj_choices, {"default": "None",
+                             "tooltip": "ArcFace projector .safetensors (from models/loras). 'None' = overlap only "
+                                        "(the projector is a weak channel; overlap latent carries identity)."}),
             "source_id": ("FLOAT", {"default": 2.0, "min": 0.0, "max": 8.0, "step": 1.0,
                                     "tooltip": "source_phase segment id (training used 2). 0 = no phase."}),
             "phase_scale": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 4.0, "step": 0.1}),
+            "id_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 50.0, "step": 0.5,
+                             "tooltip": "Multiplies the ArcFace projector tokens (only when a projector is selected). "
+                                        "Weak channel; push high (5-20) to test, very high may add artifacts."}),
+            "arcface_mode": (["auto_adjust", "as_is", "disable"], {"default": "auto_adjust",
+                             "tooltip": "auto_adjust: retry face detection with zoom-out/upscale, skip tokens if none. "
+                                        "as_is: detect on the image only. disable: skip ArcFace, use only the overlap latent."}),
             "ref_resize_mode": (["match_target", "match_target_letterbox", "native_resolution"], {"default": "match_target",
                              "tooltip": "match_target: resize ref to the OUTPUT video's pixel size via a CENTER-CROP then "
                                         "resize (old single-face-crop recipes — ref resolution never mattered, but this "
@@ -537,21 +560,12 @@ class LTXIdentityOverlapConditioning:
                                   "only by source_phase -- what every checkpoint so far was trained with). 'st_drc' "
                                   "shifts the WHOLE reference block past the target's coordinate extent on every "
                                   "axis (non-overlapping region). 'strata' shifts ONLY the temporal axis to a slot "
-                                  "past the target's own length, one slot per connected reference (reference_image -> "
-                                  "slot 0, reference_image_2 -> slot 1), leaving H/W overlapping the target -- this is "
-                                  "the 'stacked references' convention (ltx_trainer TASS strata layout, multiple "
-                                  "SEPARATE ref images under the same source_id family). Only use whichever layout "
-                                  "the loaded checkpoint was actually trained with -- using the wrong one is not a "
-                                  "quality hit, it's a coordinate convention the model never learned, so identity "
-                                  "transfer likely won't work at all."}),
-            "reference_image_2": ("IMAGE", {
-                             "tooltip": "OPTIONAL second reference image (source_id_2, default 3). Only meaningful "
-                                        "for checkpoints trained on multiple STACKED references under layout='strata' "
-                                        "(e.g. phantom_stacked_r128*) -- leave disconnected for single-reference "
-                                        "checkpoints (the overlap/st_drc convention every earlier checkpoint used)."}),
-            "source_id_2": ("FLOAT", {"default": 3.0, "min": 0.0, "max": 8.0, "step": 1.0,
-                             "tooltip": "source_phase segment id for reference_image_2 (training used 3). Only used "
-                                        "when reference_image_2 is connected."}),
+                                  "past the target's own length -- one slot per image in the reference_face batch "
+                                  "(1st image -> slot 0, 2nd -> slot 1, ...), leaving H/W overlapping the target; "
+                                  "this is the 'stacked references' convention (ltx_trainer TASS strata layout). "
+                                  "Only use whichever layout the loaded checkpoint was actually trained with -- "
+                                  "using the wrong one is not a quality hit, it's a coordinate convention the "
+                                  "model never learned, so identity transfer likely won't work at all."}),
             "reference_guidance_scale": ("FLOAT", {"default": 1.0, "min": 1.0, "max": 10.0, "step": 0.1,
                              "tooltip": "ST-DRC-style reference-CFG (arxiv 2606.02441). 1.0 = off (identical to "
                                         "before this input existed). >1.0 adds a THIRD forward pass per step with "
@@ -566,37 +580,35 @@ class LTXIdentityOverlapConditioning:
     RETURN_NAMES = ("model", "positive", "negative", "latent", "debug", "ref_preview", "crop_overlay")
     FUNCTION = "apply"
     CATEGORY = "LTX/identity"
-    DESCRIPTION = ("100%-exact overlap/st_drc/strata + source_phase reference (as trained) via a model patch. "
-                   "Reference is separate tokens (NOT I2V), any subject -- not just a face. Optional second "
-                   "reference for checkpoints trained on stacked (layout='strata') references. "
-                   "Load LoRA on MODEL first. ref_preview/crop_overlay outputs show exactly what "
-                   "gets encoded and, for match_target, what part of the reference survives the crop "
-                   "(green box) vs gets discarded.")
+    DESCRIPTION = ("100%-exact overlap+source_phase reference (as trained) via a model patch, "
+                   "plus ArcFace projector tokens. Ref is separate tokens (NOT I2V). Load LoRA on MODEL first. "
+                   "ref_preview/crop_overlay outputs (v1.10.13+) show exactly what gets encoded and, for "
+                   "match_target, what part of the reference survives the crop (green box) vs gets discarded.")
 
-    def apply(self, model, positive, negative, vae, latent, reference_image,
-              source_id=2.0, phase_scale=1.0,
-              ref_resize_mode="match_target", debug_log=False,
-              crop_anchor="center", layout="overlap", reference_guidance_scale=1.0,
-              reference_image_2=None, source_id_2=3.0):
+    def apply(self, model, positive, negative, vae, latent, reference_face,
+              identity_projector="None", source_id=2.0, phase_scale=1.0, id_strength=1.0,
+              arcface_mode="auto_adjust", ref_resize_mode="match_target", debug_log=False,
+              crop_anchor="center", layout="overlap", reference_guidance_scale=1.0):
         import comfy.samplers
         import comfy.utils
 
         global _DEBUG_ENABLED
         _DEBUG_ENABLED = bool(debug_log)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         m = model.clone()
         ltxv = _find_ltxv(m)
 
         _, w_sf, h_sf = vae.downscale_index_formula
+        n_refs = reference_face.shape[0]
 
-        def _encode_ref(ref_img):
-            """Resize (per ref_resize_mode/crop_anchor) + VAE-encode one reference image.
-            Shared by reference_image and the optional reference_image_2 -- same resize policy
-            for both, only the source pixels differ."""
+        def _encode_one(img1):
+            """Resize (per ref_resize_mode/crop_anchor) + VAE-encode ONE reference image
+            ([1,H,W,C] slice). Byte-identical to the pre-batch code path when n_refs == 1."""
             if ref_resize_mode == "native_resolution":
                 # Encode at the ref image's OWN resolution (rounded to nearest 32px),
                 # independent of the output video size -- matches training when the ref used
                 # a fixed/own bucket.
-                _, src_h, src_w, _ = ref_img.shape
+                _, src_h, src_w, _ = img1.shape
                 tgt_w = max(w_sf, round(src_w / w_sf) * w_sf)
                 tgt_h = max(h_sf, round(src_h / h_sf) * h_sf)
             else:
@@ -605,33 +617,33 @@ class LTXIdentityOverlapConditioning:
                 # a small face crop -- resolution never mattered there).
                 _, _, _, lat_h, lat_w = latent["samples"].shape
                 tgt_w, tgt_h = lat_w * w_sf, lat_h * h_sf
-            _, src_h0, src_w0, _ = ref_img.shape
+            _, src_h0, src_w0, _ = img1.shape
             crop_box = (0, 0, src_w0, src_h0)  # default: "nothing cropped" (letterbox/native modes)
             if ref_resize_mode == "match_target_letterbox":
-                ref_px = _letterbox_resize(ref_img, tgt_w, tgt_h)[:1, :, :, :3]
+                ref_px = _letterbox_resize(img1, tgt_w, tgt_h)[:1, :, :, :3]
             elif ref_resize_mode == "match_target" and crop_anchor != "center":
                 # non-default anchor: use the configurable-anchor crop (new in v1.10.13)
-                ref_px, crop_box = _anchored_crop_resize(ref_img, tgt_w, tgt_h, anchor=crop_anchor)
+                ref_px, crop_box = _anchored_crop_resize(img1, tgt_w, tgt_h, anchor=crop_anchor)
                 ref_px = ref_px[:1, :, :, :3]
             else:
                 # unchanged from before v1.10.13 -- exact original center-crop path, byte-identical
-                ref_px = comfy.utils.common_upscale(ref_img.movedim(-1, 1), tgt_w, tgt_h, "bilinear", "center").movedim(1, -1)[:1, :, :, :3]
+                ref_px = comfy.utils.common_upscale(img1.movedim(-1, 1), tgt_w, tgt_h, "bilinear", "center").movedim(1, -1)[:1, :, :, :3]
                 if ref_resize_mode == "match_target":
-                    _, crop_box = _anchored_crop_resize(ref_img, tgt_w, tgt_h, anchor="center")  # for the preview overlay only
+                    _, crop_box = _anchored_crop_resize(img1, tgt_w, tgt_h, anchor="center")  # for the preview overlay only
             ref_lat = vae.encode(ref_px)
-            return ref_lat, ref_px.clone(), crop_box
+            overlay = _draw_crop_overlay(img1[:1], crop_box)
+            return ref_lat, ref_px.clone(), overlay, crop_box, src_w0, src_h0
 
-        ref_lat, ref_preview, crop_box = _encode_ref(reference_image)
-        _, src_h0, src_w0, _ = reference_image.shape
-        crop_overlay = _draw_crop_overlay(reference_image[:1], crop_box)
-
-        has_ref2 = reference_image_2 is not None and getattr(reference_image_2, "shape", (0,))[0] > 0
-        ref_specs = [{"latent": ref_lat, "seg_value": float(source_id) * float(phase_scale),
-                      "layout": layout, "strata_slot": 0}]
-        if has_ref2:
-            ref_lat2, _, _ = _encode_ref(reference_image_2)
-            ref_specs.append({"latent": ref_lat2, "seg_value": float(source_id_2) * float(phase_scale),
-                              "layout": layout, "strata_slot": 1})
+        ref_specs, ref_previews, crop_overlays = [], [], []
+        for i in range(n_refs):
+            ref_lat_i, ref_px_i, overlay_i, crop_box, src_w0, src_h0 = _encode_one(reference_face[i:i + 1])
+            ref_specs.append({"latent": ref_lat_i, "seg_value": (float(source_id) + i) * float(phase_scale),
+                              "layout": layout, "strata_slot": i})
+            ref_previews.append(ref_px_i)
+            crop_overlays.append(overlay_i)
+        ref_lat = ref_specs[0]["latent"]  # for the debug string below (1st ref's shape)
+        ref_preview = torch.cat(ref_previews, dim=0)
+        crop_overlay = torch.cat(crop_overlays, dim=0)
 
         _install_patches(ltxv)
         ltxv._id_rope_theta = 10000.0
@@ -672,12 +684,48 @@ class LTXIdentityOverlapConditioning:
 
             m.set_model_sampler_cfg_function(_ref_cfg_function, disable_cfg1_optimization=True)
 
+        # ArcFace projector tokens on the text context — fully OPTIONAL. Skipped when the
+        # projector dropdown is 'None', arcface is disabled, or no face is detected. The
+        # overlap latent carries the bulk of identity, so this is safe to skip. Only the
+        # FIRST reference image (index 0, slot 0 -- the "primary"/face slot) drives it, same
+        # as the single-image behavior before batched references existed.
+        use_projector = identity_projector not in (None, "", "None")
+        emb = _arcface_embed(reference_face[:1], mode=arcface_mode) if use_projector else None
+        if not use_projector:
+            arc_status = "no projector (overlap only)"
+        elif arcface_mode == "disable":
+            arc_status = "disabled"
+        else:
+            arc_status = "OK" if emb is not None else "NO FACE -> skipped (overlap only)"
+        if emb is not None:
+            path = identity_projector
+            if not os.path.isabs(path):
+                try:
+                    import folder_paths
+                    resolved = folder_paths.get_full_path("loras", identity_projector)
+                    if resolved:
+                        path = resolved
+                except Exception:
+                    pass
+            if not os.path.isabs(path) or not os.path.exists(path):
+                for b in ("models/loras", "models", "."):
+                    if os.path.exists(os.path.join(b, identity_projector)):
+                        path = os.path.join(b, identity_projector); break
+            projector = _load_projector(path, device)
+            emb = emb.to(device=device, dtype=torch.float32).unsqueeze(0)
+            with torch.no_grad():
+                id_tok = projector(emb) * float(id_strength)
+                unc = projector(torch.zeros(1, projector.in_dim, device=device))
+            positive = _append_ctx_tokens(positive, id_tok)
+            negative = _append_ctx_tokens(negative, unc)
+
+        seg_list = ", ".join(f"#{i}={s['seg_value']:g}" for i, s in enumerate(ref_specs))
         dbg = (
             "=== LTX Identity OVERLAP (exact) ===\n"
-            f"ref latent: {list(ref_lat.shape)} (encoded at {ref_preview.shape[2]}x{ref_preview.shape[1]}px, "
+            f"references: {n_refs} (encoded at {ref_preview.shape[2]}x{ref_preview.shape[1]}px each, "
             f"mode={ref_resize_mode}{f', crop_anchor={crop_anchor}' if ref_resize_mode == 'match_target' else ''}) "
-            f"-> {layout} tokens, source_phase seg={float(source_id)*float(phase_scale)}\n"
-            f"reference_image_2: {'connected, seg=' + str(float(source_id_2)*float(phase_scale)) + ' (slot 1)' if has_ref2 else 'not connected (single-ref)'}\n"
+            f"-> {layout} tokens, source_phase seg per ref: {seg_list}\n"
+            f"arcface: {arc_status} (mode={arcface_mode}) | id_strength={id_strength}\n"
             f"patches on {type(ltxv).__name__}: process_input/prepare_timestep/prepare_pe/process_output\n"
             f"crop preview: kept region {crop_box[2]}x{crop_box[3]}px of the {src_w0}x{src_h0}px reference "
             "-- see the ref_preview/crop_overlay IMAGE outputs to inspect what gets kept vs discarded.\n"
