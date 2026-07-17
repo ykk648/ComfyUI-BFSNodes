@@ -197,6 +197,59 @@ def _letterbox_resize(ref_img, tgt_w, tgt_h, pad_value=1.0):
     return padded.movedim(1, -1)
 
 
+def _anchored_crop_resize(ref_img, tgt_w, tgt_h, anchor="center"):
+    """Like comfy.utils.common_upscale(..., crop="center") but with a configurable anchor
+    for WHICH part of the source survives the crop when the aspect ratio doesn't match,
+    instead of always the exact center (e.g. anchor="top" keeps the top of the sheet --
+    useful when the face closeup panel isn't centered in your layout). Returns the
+    cropped+resized image plus the crop box (x0, y0, crop_w, crop_h) in SOURCE pixel
+    coords, for drawing a preview overlay."""
+    import comfy.utils
+    x_img = ref_img.movedim(-1, 1)  # [B,C,H,W]
+    _, _, old_h, old_w = x_img.shape
+    old_aspect = old_w / old_h
+    new_aspect = tgt_w / tgt_h
+    x0, y0, crop_w, crop_h = 0, 0, old_w, old_h
+    if old_aspect > new_aspect:
+        # source wider than target -- crop width
+        crop_w = max(1, round(old_w * (new_aspect / old_aspect)))
+        if anchor == "left":
+            x0 = 0
+        elif anchor == "right":
+            x0 = old_w - crop_w
+        else:
+            x0 = (old_w - crop_w) // 2
+    elif old_aspect < new_aspect:
+        # source taller than target -- crop height
+        crop_h = max(1, round(old_h * (old_aspect / new_aspect)))
+        if anchor == "top":
+            y0 = 0
+        elif anchor == "bottom":
+            y0 = old_h - crop_h
+        else:
+            y0 = (old_h - crop_h) // 2
+    cropped = x_img[:, :, y0:y0 + crop_h, x0:x0 + crop_w]
+    out = comfy.utils.common_upscale(cropped, tgt_w, tgt_h, "bilinear", "disabled")
+    return out.movedim(1, -1), (x0, y0, crop_w, crop_h)
+
+
+def _draw_crop_overlay(ref_img, box):
+    """Original reference with a green rectangle around the region that SURVIVES the crop
+    (everything outside the rectangle gets discarded). box = (x0, y0, w, h) in source pixel
+    coords, e.g. from _anchored_crop_resize. If box covers the whole image (no crop, as in
+    letterbox/native_resolution modes), the rectangle just outlines the full frame."""
+    from PIL import Image, ImageDraw
+    x0, y0, cw, ch = box
+    arr = (ref_img[0, :, :, :3].clamp(0, 1).cpu().numpy() * 255).astype(np.uint8)
+    pil = Image.fromarray(arr).convert("RGB")
+    draw = ImageDraw.Draw(pil)
+    w, h = pil.size
+    lw = max(2, min(w, h) // 150)
+    draw.rectangle([x0, y0, x0 + cw - 1, y0 + ch - 1], outline=(0, 255, 0), width=lw)
+    out = torch.from_numpy(np.array(pil).astype(np.float32) / 255.0).unsqueeze(0)
+    return out
+
+
 def _install_patches(ltxv):
     if getattr(ltxv, "_id_overlap_patched", False):
         return
@@ -398,18 +451,30 @@ class LTXIdentityOverlapConditioning:
                                         "match_target_letterbox first if you hit that."}),
             "debug_log": ("BOOLEAN", {"default": False,
                           "tooltip": "Print per-step [LTXIdOverlap] shape logs to the console (for debugging)."}),
+        }, "optional": {
+            "crop_anchor": (["center", "top", "bottom", "left", "right"], {"default": "center",
+                             "tooltip": "New in v1.10.13, optional -- old workflows without this input keep the "
+                                        "previous always-center-crop behavior. Only used by match_target (the "
+                                        "crop-then-resize mode). Which part of the reference survives the crop when its "
+                                        "aspect ratio doesn't match the output -- e.g. if your sheet's face closeup is "
+                                        "in the top row, set 'top' instead of the default center crop so it doesn't get "
+                                        "cut off. No effect on match_target_letterbox or native_resolution (neither "
+                                        "ever crops)."}),
         }}
 
-    RETURN_TYPES = ("MODEL", "CONDITIONING", "CONDITIONING", "LATENT", "STRING")
-    RETURN_NAMES = ("model", "positive", "negative", "latent", "debug")
+    RETURN_TYPES = ("MODEL", "CONDITIONING", "CONDITIONING", "LATENT", "STRING", "IMAGE", "IMAGE")
+    RETURN_NAMES = ("model", "positive", "negative", "latent", "debug", "ref_preview", "crop_overlay")
     FUNCTION = "apply"
     CATEGORY = "LTX/identity"
     DESCRIPTION = ("100%-exact overlap+source_phase reference (as trained) via a model patch, "
-                   "plus ArcFace projector tokens. Ref is separate tokens (NOT I2V). Load LoRA on MODEL first.")
+                   "plus ArcFace projector tokens. Ref is separate tokens (NOT I2V). Load LoRA on MODEL first. "
+                   "ref_preview/crop_overlay outputs (v1.10.13+) show exactly what gets encoded and, for "
+                   "match_target, what part of the reference survives the crop (green box) vs gets discarded.")
 
     def apply(self, model, positive, negative, vae, latent, reference_face,
               identity_projector="None", source_id=2.0, phase_scale=1.0, id_strength=1.0,
-              arcface_mode="auto_adjust", ref_resize_mode="match_target", debug_log=False):
+              arcface_mode="auto_adjust", ref_resize_mode="match_target", debug_log=False,
+              crop_anchor="center"):
         import comfy.utils
 
         global _DEBUG_ENABLED
@@ -431,11 +496,22 @@ class LTXIdentityOverlapConditioning:
             # face crop — resolution never mattered there).
             _, _, _, lat_h, lat_w = latent["samples"].shape
             tgt_w, tgt_h = lat_w * w_sf, lat_h * h_sf
+        _, src_h0, src_w0, _ = reference_face.shape
+        crop_box = (0, 0, src_w0, src_h0)  # default: "nothing cropped" (letterbox/native modes)
         if ref_resize_mode == "match_target_letterbox":
             ref_px = _letterbox_resize(reference_face, tgt_w, tgt_h)[:1, :, :, :3]
+        elif ref_resize_mode == "match_target" and crop_anchor != "center":
+            # non-default anchor: use the configurable-anchor crop (new in v1.10.13)
+            ref_px, crop_box = _anchored_crop_resize(reference_face, tgt_w, tgt_h, anchor=crop_anchor)
+            ref_px = ref_px[:1, :, :, :3]
         else:
+            # unchanged from before v1.10.13 -- exact original center-crop path, byte-identical
             ref_px = comfy.utils.common_upscale(reference_face.movedim(-1, 1), tgt_w, tgt_h, "bilinear", "center").movedim(1, -1)[:1, :, :, :3]
+            if ref_resize_mode == "match_target":
+                _, crop_box = _anchored_crop_resize(reference_face, tgt_w, tgt_h, anchor="center")  # for the preview overlay only
         ref_lat = vae.encode(ref_px)
+        ref_preview = ref_px.clone()
+        crop_overlay = _draw_crop_overlay(reference_face[:1], crop_box)
 
         _install_patches(ltxv)
         ltxv._id_seg_value = float(source_id) * float(phase_scale)
@@ -480,16 +556,19 @@ class LTXIdentityOverlapConditioning:
 
         dbg = (
             "=== LTX Identity OVERLAP (exact) ===\n"
-            f"ref latent: {list(ref_lat.shape)} (encoded at {tgt_w}x{tgt_h}px, mode={ref_resize_mode}) "
+            f"ref latent: {list(ref_lat.shape)} (encoded at {tgt_w}x{tgt_h}px, mode={ref_resize_mode}"
+            f"{f', crop_anchor={crop_anchor}' if ref_resize_mode == 'match_target' else ''}) "
             f"-> overlap tokens (frame-0 grid), source_phase seg={float(source_id)*float(phase_scale)}\n"
             f"arcface: {arc_status} (mode={arcface_mode}) | id_strength={id_strength}\n"
             f"patches on {type(ltxv).__name__}: process_input/prepare_timestep/prepare_pe/process_output\n"
+            f"crop preview: kept region {crop_box[2]}x{crop_box[3]}px of the {src_w0}x{src_h0}px reference "
+            "-- see the ref_preview/crop_overlay IMAGE outputs to inspect what gets kept vs discarded.\n"
             "Set LTX_IDOVERLAP_DEBUG=1 for per-step shape logs. Connect negative + CFG 3-5, no LightX2V."
         )
         log.info("\n" + dbg)
         # pass the latent through unchanged (the ref is injected inside the model, not here)
         # so the graph can chain Empty -> this node -> sampler without branching.
-        return (m, positive, negative, latent, dbg)
+        return (m, positive, negative, latent, dbg, ref_preview, crop_overlay)
 
 
 # Public node id + display name. Keep the old key as an alias so existing workflows load.
